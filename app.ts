@@ -11,6 +11,42 @@ const app = express();
 
 app.use(express.json());
 
+// Server-side Estonian voice fallback for devices without an installed voice.
+app.post('/api/speech', async (req, res) => {
+  const { text, language } = req.body ?? {};
+  if (language !== 'et' || typeof text !== 'string' || !text.trim() || text.length > 5000) {
+    return res.status(400).json({ error: 'invalid_request' });
+  }
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'speech_not_configured' });
+  try {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      signal: AbortSignal.timeout(60000),
+      body: JSON.stringify({
+        model: process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-lite-tts',
+        input: [{ type: 'user_input', content: [{ type: 'text', text: text.trim(), annotations: [{ type: 'speech_metadata', style: 'Speak naturally and clearly in Estonian.' }] }] }],
+        response_format: { type: 'audio' },
+        generation_config: { speech_config: [{ voice: 'Puck' }] },
+      }),
+    });
+    if (!response.ok) {
+      console.error('[Speech API] Upstream status:', response.status);
+      return res.status(response.status === 429 ? 429 : 502).json({ error: 'speech_unavailable' });
+    }
+    const result = await response.json();
+    const audio = result.steps?.filter((step: any) => step.type === 'model_output')
+      .flatMap((step: any) => step.content ?? []).filter((part: any) => part.type === 'audio').at(-1);
+    if (!audio?.data) return res.status(502).json({ error: 'speech_unavailable' });
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(Buffer.from(audio.data, 'base64'));
+  } catch {
+    return res.status(502).json({ error: 'speech_unavailable' });
+  }
+});
+
 // Initialize server-side Gemini client
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;

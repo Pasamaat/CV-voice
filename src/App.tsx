@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { createVoiceInput } from './voiceInput';
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Send,
@@ -53,13 +54,12 @@ const TRANSLATIONS = {
     chooseVoice: 'Voice',
     previewVoice: 'Preview voice',
     previewText: "Hello, I am Erik's assistant. How can I help you today?",
-    noEstonianVoiceNotice: 'No Estonian speech synthesis voice was found on your device. Spoken playback is paused and answers are displayed as text.',
     noVoiceForLangNotice: 'No suitable voice found for this language on your device. Answers are displayed as text.',
     welcomeTitle: 'Welcome to Erik’s CV Assistant',
     welcomeDesc: 'Ask any question by typing or speaking. Learn about Erik Radik’s university studies at EBS, practical work experience, leadership in the Estonian Defence Forces, or ongoing CNC training.',
     placeholder: 'Ask about studies, work, CNC training, or languages...',
     send: 'Send',
-    listeningNow: 'Listening... speak your question.',
+    listeningNow: 'Listening… your question sends after 3 seconds of silence.',
     stopListening: 'Stop listening',
     micUnsupported: 'Speech recognition is not supported in this browser. Please type your question.',
     micDenied: 'Microphone permission was denied. Please allow microphone access in your browser or type your question.',
@@ -106,13 +106,12 @@ const TRANSLATIONS = {
     chooseVoice: 'Hääl',
     previewVoice: 'Kuula näidist',
     previewText: 'Tere! Olen Eriku assistent. Kuidas saan teid aidata?',
-    noEstonianVoiceNotice: 'Teie seadmes puudub eesti keele häälesünteesi hääl. Vastuseid kuvatakse tekstina.',
     noVoiceForLangNotice: 'Selle keele jaoks ei leitud teie seadmes sobivat häält. Vastuseid kuvatakse tekstina.',
     welcomeTitle: 'Tere tulemast Eriku CV-assistenti',
     welcomeDesc: 'Esita küsimus trükkides või häälega. Tutvu Erik Radiku õpingutega EBS-is, praktiliste töökogemustega, juhtimiskogemusega Kaitseväes või poolelioleva CNC-koolitusega.',
     placeholder: 'Küsi õpingute, töökogemuse, CNC-koolituse või keelte kohta...',
     send: 'Saada',
-    listeningNow: 'Kuulan... esita oma küsimus.',
+    listeningNow: 'Kuulan… küsimus saadetakse pärast 3 sekundit vaikust.',
     stopListening: 'Lõpeta kuulamine',
     micUnsupported: 'Kõnetuvastus pole selles veebilehitsejas toetatud. Palun trüki oma küsimus.',
     micDenied: 'Mikrofoni ligipääs on keelatud. Palun luba mikrofon brauseri seadetest või trüki oma küsimus.',
@@ -205,7 +204,13 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
   const [speechRecSupported, setSpeechRecSupported] = useState(false);
-  const recognitionRef = useRef<any>(null);
+  const recognitionRef = useRef<ReturnType<typeof createVoiceInput> | null>(null);
+  const sendMessageRef = useRef<(text: string) => void>(() => {});
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const speechRequestRef = useRef<AbortController | null>(null);
+  const speechGenerationRef = useRef(0);
+  const sendingRef = useRef(false);
 
   // Spoken Output (Speech Synthesis) state
   const [speechSynthSupported, setSpeechSynthSupported] = useState(false);
@@ -258,7 +263,7 @@ export default function App() {
       ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window);
     setSpeechRecSupported(Boolean(hasRec));
 
-    const hasSynth = typeof window !== 'undefined' && 'speechSynthesis' in window;
+    const hasSynth = typeof window !== 'undefined' && ('speechSynthesis' in window || 'AudioContext' in window);
     setSpeechSynthSupported(Boolean(hasSynth));
   }, []);
 
@@ -300,7 +305,7 @@ export default function App() {
     if (selectedLang === 'et') {
       if (currentLangVoices.length === 0) {
         setSelectedVoiceUri('');
-        setVoiceNotice(t.noEstonianVoiceNotice);
+        setVoiceNotice(null);
       } else {
         // Prefer male Estonian voice if discernible, otherwise first Estonian voice
         const maleEt = currentLangVoices.find(
@@ -350,8 +355,15 @@ export default function App() {
   // Clean up recognition and speech on unmount
   useEffect(() => {
     return () => {
+      speechRequestRef.current?.abort();
+      speechGenerationRef.current++;
+      if (audioSourceRef.current) {
+        audioSourceRef.current.onended = null;
+        audioSourceRef.current.stop();
+      }
+      void audioContextRef.current?.close();
       if (recognitionRef.current) {
-        recognitionRef.current.abort();
+        recognitionRef.current.cancel();
       }
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
@@ -359,7 +371,20 @@ export default function App() {
     };
   }, []);
 
+  const unlockAudio = () => {
+    if (!audioContextRef.current && 'AudioContext' in window) audioContextRef.current = new AudioContext();
+    void audioContextRef.current?.resume().catch(() => {});
+  };
+
   const stopSpeaking = () => {
+    speechGenerationRef.current++;
+    speechRequestRef.current?.abort();
+    speechRequestRef.current = null;
+    if (audioSourceRef.current) {
+      audioSourceRef.current.onended = null;
+      audioSourceRef.current.stop();
+      audioSourceRef.current = null;
+    }
     speechQueueRef.current = [];
     isSpeakingRef.current = false;
     setIsSpeaking(false);
@@ -371,7 +396,7 @@ export default function App() {
   const stopListening = () => {
     if (recognitionRef.current) {
       try {
-        recognitionRef.current.stop();
+        recognitionRef.current.cancel();
       } catch {
         // ignore
       }
@@ -399,12 +424,6 @@ export default function App() {
   const processSpeechQueue = () => {
     if (!speechSynthSupported || !voiceEnabledRef.current) return;
 
-    // Safety: In Estonian, never read using an incompatible non-Estonian voice
-    if (selectedLangRef.current === 'et' && currentLangVoices.length === 0) {
-      isSpeakingRef.current = false;
-      setIsSpeaking(false);
-      return;
-    }
 
     if (speechQueueRef.current.length === 0) {
       isSpeakingRef.current = false;
@@ -422,6 +441,46 @@ export default function App() {
 
     isSpeakingRef.current = true;
     setIsSpeaking(true);
+
+    if (selectedLangRef.current === 'et' && !window.speechSynthesis?.getVoices().some(v => v.lang.toLowerCase().startsWith('et'))) {
+      const generation = speechGenerationRef.current;
+      const controller = new AbortController();
+      speechRequestRef.current = controller;
+      void (async () => {
+        try {
+          const response = await fetch('/api/speech', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: sentenceToSpeak, language: 'et' }), signal: controller.signal,
+          });
+          if (!response.ok) throw new Error('Speech unavailable');
+          const data = await response.arrayBuffer();
+          if (generation !== speechGenerationRef.current) return;
+          const context = audioContextRef.current;
+          if (!context) throw new Error('Audio unavailable');
+          const buffer = await context.decodeAudioData(data);
+          if (generation !== speechGenerationRef.current) return;
+          await context.resume();
+          if (generation !== speechGenerationRef.current) return;
+          const source = context.createBufferSource();
+          source.buffer = buffer;
+          source.connect(context.destination);
+          audioSourceRef.current = source;
+          source.onended = () => {
+            audioSourceRef.current = null;
+            isSpeakingRef.current = false;
+            processSpeechQueue();
+          };
+          source.start();
+        } catch {
+          if (generation !== speechGenerationRef.current) return;
+          speechQueueRef.current = [];
+          isSpeakingRef.current = false;
+          setIsSpeaking(false);
+          setVoiceNotice('Eestikeelse heli esitamine ebaõnnestus. Vastus on loetav tekstina. Proovi hääl uuesti sisse lülitada.');
+        }
+      })();
+      return;
+    }
 
     const utterance = new SpeechSynthesisUtterance(sentenceToSpeak);
     utterance.rate = 1.0;
@@ -455,7 +514,7 @@ export default function App() {
 
   const queueSentenceForSpeech = (sentence: string) => {
     if (!speechSynthSupported || !voiceEnabledRef.current) return;
-    if (selectedLangRef.current === 'et' && currentLangVoices.length === 0) return;
+
 
     const cleaned = cleanTextForSpeech(sentence);
     if (!cleaned || cleaned.length < 2) return;
@@ -472,7 +531,8 @@ export default function App() {
     stopSpeaking();
 
     if (selectedLang === 'et' && currentLangVoices.length === 0) {
-      setVoiceNotice(t.noEstonianVoiceNotice);
+      unlockAudio();
+      queueSentenceForSpeech(t.previewText);
       return;
     }
 
@@ -511,6 +571,8 @@ export default function App() {
       setVoiceEnabled(false);
       stopSpeaking();
     } else {
+      unlockAudio();
+      setVoiceNotice(null);
       setVoiceEnabled(true);
     }
   };
@@ -526,40 +588,15 @@ export default function App() {
 
     const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     try {
-      const recognition = new SpeechRec();
-      recognition.continuous = false;
-      recognition.interimResults = true;
-      // Use en-GB for English, et-EE for Estonian
-      recognition.lang = selectedLang === 'et' ? 'et-EE' : 'en-GB';
-
-      recognition.onstart = () => {
-        setIsListening(true);
-      };
-
-      recognition.onresult = (event: any) => {
-        let transcript = '';
-        for (let i = 0; i < event.results.length; i++) {
-          transcript += event.results[i][0].transcript;
-        }
-        setInputValue(transcript);
-      };
-
-      recognition.onerror = (event: any) => {
-        console.warn('Speech recognition error:', event.error);
-        if (event.error === 'not-allowed' || event.error === 'permission-denied') {
-          setMicError(t.micDenied);
-        } else if (event.error === 'no-speech') {
-          // harmless
-        } else {
-          setMicError(`${t.micErrorPrefix}${event.error}`);
-        }
-        setIsListening(false);
-      };
-
-      recognition.onend = () => {
-        setIsListening(false);
-      };
-
+      unlockAudio();
+      setVoiceEnabled(true);
+      const recognition = createVoiceInput(SpeechRec, {
+        language: selectedLang === 'et' ? 'et-EE' : 'en-GB',
+        onText: setInputValue,
+        onSend: (text) => sendMessageRef.current(text),
+        onListening: setIsListening,
+        onError: (error) => setMicError(error === 'not-allowed' || error === 'permission-denied' ? t.micDenied : `${t.micErrorPrefix}${error}`),
+      });
       recognitionRef.current = recognition;
       recognition.start();
     } catch (err: any) {
@@ -571,7 +608,9 @@ export default function App() {
 
   const handleSendMessage = async (promptToSend?: string) => {
     const text = (promptToSend ?? inputValue).trim();
-    if (!text || isLoading) return;
+    if (!text || sendingRef.current) return;
+    sendingRef.current = true;
+    if (voiceEnabledRef.current) unlockAudio();
 
     setErrorState(null);
     setMicError(null);
@@ -708,7 +747,7 @@ export default function App() {
                   );
 
                   // Extract complete sentences for spoken answers
-                  if (voiceEnabledRef.current) {
+                  if (voiceEnabledRef.current && !(selectedLang === 'et' && currentLangVoices.length === 0)) {
                     const { sentences } = extractCompleteSentences(accumulatedText);
                     while (queuedSentenceCountRef.current < sentences.length) {
                       const nextSentence = sentences[queuedSentenceCountRef.current];
@@ -727,7 +766,9 @@ export default function App() {
 
       // Speak any remaining unpunctuated text at end of stream
       if (voiceEnabledRef.current && accumulatedText.trim()) {
-        const { remainder } = extractCompleteSentences(accumulatedText);
+        const { remainder } = selectedLang === 'et' && currentLangVoices.length === 0
+          ? { remainder: accumulatedText }
+          : extractCompleteSentences(accumulatedText);
         if (remainder && remainder.trim()) {
           queueSentenceForSpeech(remainder.trim());
         }
@@ -758,9 +799,11 @@ export default function App() {
         failedPrompt: text,
       });
     } finally {
+      sendingRef.current = false;
       setIsLoading(false);
     }
   };
+  sendMessageRef.current = (text) => { void handleSendMessage(text); };
 
   const handleReset = () => {
     stopSpeaking();
@@ -1235,7 +1278,7 @@ export default function App() {
               <textarea
                 ref={textareaRef}
                 value={inputValue}
-                onChange={(e) => setInputValue(e.target.value)}
+                onChange={(e) => { stopListening(); setInputValue(e.target.value); }}
                 onKeyDown={handleKeyDown}
                 placeholder={t.placeholder}
                 disabled={isLoading}
