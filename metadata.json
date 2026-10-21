@@ -1,0 +1,7 @@
+{
+  "name": "Ask about Erik",
+  "description": "A personal introduction and CV assistant for Erik Radik.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
